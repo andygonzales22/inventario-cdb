@@ -1,0 +1,580 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, updateDoc } from 'firebase/firestore';
+import { 
+  Loader2, ScanLine, Package, History, X, 
+  Layers, CheckCircle2, AlertTriangle, 
+  FileDown, Plus, ChevronRight, ArrowLeft,
+  Download, Edit3, Trash2, Printer, Search, Camera, FlipHorizontal
+} from 'lucide-react';
+
+// ============================================================
+// CONFIGURACIÓN DE APP
+// ============================================================
+const APP_LOGO_URL = "https://cdn-icons-png.freepik.com/256/11536/11536552.png?semt=ais_white_label";
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'maderera-app-cbd';
+
+const BarcodeDisplay = ({ value, id }) => {
+  const canvasRef = useRef(null);
+  useEffect(() => {
+    if (canvasRef.current && window.JsBarcode) {
+      window.JsBarcode(canvasRef.current, value, {
+        format: "CODE128",
+        lineColor: "#000",
+        width: 2,
+        height: 80,
+        displayValue: true,
+        fontSize: 14,
+        margin: 10
+      });
+    }
+  }, [value]);
+  return <canvas ref={canvasRef} id={id} className="max-w-full h-auto mx-auto border rounded-2xl bg-white"></canvas>;
+};
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('menu'); 
+  const [packages, setPackages] = useState([]);
+  const [selectedPackage, setSelectedPackage] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState({ text: '', type: '' });
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  
+  // Estados para Scan
+  const [isScannerOpen, setIsScannerOpen] = useState(false);
+  const [scanInput, setScanInput] = useState('');
+  const scannerRef = useRef(null);
+
+  const [formData, setFormData] = useState({
+    materia: 'Tabla', largo: '', ancho: '', espesor: '', cantidad: '', procedencia: '', estado: 'Stock', volumenManual: '', oldId: null
+  });
+
+  // Cargar librerías externas
+  useEffect(() => {
+    const scripts = [
+      'https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js',
+      'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+      'https://unpkg.com/html5-qrcode'
+    ];
+    scripts.forEach(src => {
+      if (!document.querySelector(`script[src="${src}"]`)) {
+        const script = document.createElement('script');
+        script.src = src;
+        script.async = true;
+        document.body.appendChild(script);
+      }
+    });
+  }, []);
+
+  // Lógica de la Cámara (Scanner)
+  useEffect(() => {
+    let html5QrCode = null;
+
+    if (isScannerOpen && window.Html5Qrcode) {
+      html5QrCode = new window.Html5Qrcode("reader");
+      
+      const config = { fps: 10, qrbox: { width: 250, height: 150 } };
+
+      html5QrCode.start(
+        { facingMode: "environment" }, 
+        config,
+        (decodedText) => {
+          // Éxito al escanear
+          setScanInput(decodedText);
+          handleScanSuccess(decodedText);
+          // Vibración opcional si el dispositivo lo soporta
+          if (navigator.vibrate) navigator.vibrate(100);
+        },
+        (errorMessage) => {
+          // Error silencioso mientras busca
+        }
+      ).catch(err => {
+        console.error("Error al iniciar cámara:", err);
+        showToast("Error al acceder a la cámara", "error");
+      });
+    }
+
+    return () => {
+      if (html5QrCode && html5QrCode.isScanning) {
+        html5QrCode.stop().catch(err => console.error("Error al detener cámara", err));
+      }
+    };
+  }, [isScannerOpen]);
+
+  const handleScanSuccess = (id) => {
+    const found = packages.find(p => String(p.id) === String(id));
+    if (found) {
+      setSelectedPackage(found);
+      setIsScannerOpen(false);
+      setScanInput('');
+    } else {
+      showToast('ID Escaneado: ' + id + ' (No encontrado)', 'error');
+    }
+  };
+
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) { console.error(err); }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    const q = collection(db, 'artifacts', appId, 'public', 'data', 'paquetes');
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const data = snapshot.docs.map(doc => doc.data());
+      setPackages(data.sort((a, b) => {
+        const dateA = a.fechaISO ? new Date(a.fechaISO) : new Date(0);
+        const dateB = b.fechaISO ? new Date(b.fechaISO) : new Date(0);
+        return dateB - dateA;
+      }));
+    }, (error) => console.error("Error Firestore:", error));
+    return () => unsubscribe();
+  }, [user]);
+
+  const showToast = (text, type) => {
+    setMsg({ text, type });
+    setTimeout(() => setMsg({ text: '', type: '' }), 3000);
+  };
+
+  const handleScanSearch = (e) => {
+    if (e) e.preventDefault();
+    handleScanSuccess(scanInput);
+  };
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    if (!user) return;
+    setLoading(true);
+    
+    const finalId = formData.oldId || Math.floor(10000000 + Math.random() * 90000000).toString();
+    
+    let calculatedVolumen;
+    if (formData.materia === 'Descarte') {
+      calculatedVolumen = Number(formData.volumenManual).toFixed(4);
+    } else {
+      calculatedVolumen = ((Number(formData.largo) * Number(formData.ancho) * Number(formData.espesor) * Number(formData.cantidad)) / 1000000000).toFixed(4);
+    }
+
+    const now = new Date();
+    const dia = String(now.getDate()).padStart(2, '0');
+    const mes = String(now.getMonth() + 1).padStart(2, '0');
+    const anio = now.getFullYear();
+    const fechaFormateada = `${dia}/${mes}/${anio} ${now.toLocaleTimeString()}`;
+
+    const newPackageData = {
+      ...formData,
+      id: finalId,
+      volumen: calculatedVolumen,
+      fecha: fechaFormateada,
+      fechaISO: now.toISOString(),
+      uid: user.uid
+    };
+    delete newPackageData.oldId;
+    delete newPackageData.volumenManual;
+
+    try {
+      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'paquetes', finalId), newPackageData);
+      showToast(formData.oldId ? '🔄 Registro actualizado' : '✅ Registro exitoso', 'success');
+      setFormData({ materia: 'Tabla', largo: '', ancho: '', espesor: '', cantidad: '', procedencia: '', estado: 'Stock', volumenManual: '', oldId: null });
+      setView('history'); 
+    } catch (err) {
+      showToast('❌ Error al guardar', 'error');
+    } finally { setLoading(false); }
+  };
+
+  const updateStatus = async (id, newStatus) => {
+    if (!user) return;
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'paquetes', id), {
+        estado: newStatus
+      });
+      showToast(`📦 Estado: ${newStatus}`, 'success');
+      setSelectedPackage(prev => ({ ...prev, estado: newStatus }));
+    } catch (err) {
+      showToast('❌ Error al actualizar', 'error');
+    }
+  };
+
+  const deletePackage = async (id) => {
+    if (!user) return;
+    setLoading(true);
+    try {
+      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'paquetes', id));
+      showToast('🗑️ Eliminado', 'success');
+      setSelectedPackage(null);
+      setConfirmDelete(false);
+    } catch (err) {
+      showToast('❌ Error', 'error');
+    } finally { setLoading(false); }
+  };
+
+  const editPackage = (p) => {
+    setFormData({
+      materia: p.materia,
+      largo: p.largo || '',
+      ancho: p.ancho || '',
+      espesor: p.espesor || '',
+      cantidad: p.cantidad || '',
+      procedencia: p.procedencia,
+      estado: p.estado,
+      volumenManual: p.materia === 'Descarte' ? p.volumen : '',
+      oldId: p.id
+    });
+    setSelectedPackage(null);
+    setView('register');
+  };
+
+  const exportToExcel = () => {
+    if (!window.XLSX) return;
+    const data = packages.map(p => ({
+      'ID PAQUETE': p.id, 
+      'MATERIA': p.materia, 
+      'VOLUMEN (m³)': p.volumen, 
+      'L (mm)': p.largo || '-',
+      'A (mm)': p.ancho || '-',
+      'E (mm)': p.espesor || '-',
+      'CANTIDAD': p.cantidad || '-',
+      'ORIGEN/LOTE': p.procedencia, 
+      'ESTADO ACTUAL': p.estado, 
+      'FECHA Y HORA REGISTRO': p.fecha 
+    }));
+    const ws = window.XLSX.utils.json_to_sheet(data);
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, ws, "Inventario_CDB");
+    window.XLSX.writeFile(wb, `Inventario_CDB.xlsx`);
+  };
+
+  const printBarcode = () => {
+    const canvas = document.getElementById('barcode-print');
+    if (!canvas) return;
+    const dataUrl = canvas.toDataURL();
+    const windowPrint = window.open('', '_blank');
+    windowPrint.document.write(`
+      <html>
+        <head><style>body { margin: 0; display: flex; flex-direction: column; align-items: center; font-family: sans-serif; text-align: center; padding: 20px; } img { max-width: 100%; }</style></head>
+        <body onload="window.print();window.close()">
+          <div style="font-size: 20px; font-weight: bold;">${selectedPackage.materia}</div>
+          <div style="font-size: 16px;">Lote: ${selectedPackage.procedencia}</div>
+          <img src="${dataUrl}" />
+          <div style="font-size: 18px; font-weight: bold;">ID: ${selectedPackage.id}</div>
+        </body>
+      </html>
+    `);
+    windowPrint.document.close();
+  };
+
+  const getStatusColor = (status) => {
+    switch (status) {
+      case 'Stock': return 'bg-blue-100 text-blue-700';
+      case 'Despacho': return 'bg-orange-100 text-orange-700';
+      case 'Recibido': return 'bg-green-100 text-green-700';
+      default: return 'bg-slate-100 text-slate-700';
+    }
+  };
+
+  return (
+    <div className="flex justify-center items-center h-screen w-screen bg-slate-900 font-sans overflow-hidden">
+      <div className="relative w-full h-full bg-white flex flex-col overflow-hidden">
+        <div className="h-8 bg-white shrink-0"></div>
+
+        {msg.text && (
+          <div className={`fixed top-12 left-1/2 -translate-x-1/2 w-[90%] px-4 py-3 rounded-2xl shadow-2xl z-[3000] flex items-center gap-3 animate-in slide-in-from-top ${msg.type === 'success' ? 'bg-green-600' : 'bg-red-600'} text-white`}>
+            {msg.type === 'success' ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
+            <span className="text-xs font-bold uppercase">{msg.text}</span>
+          </div>
+        )}
+
+        {/* Modal Cámara Real */}
+        {isScannerOpen && (
+          <div className="fixed inset-0 z-[2500] bg-black flex flex-col animate-in fade-in">
+            <div className="p-6 flex justify-between items-center text-white relative z-10">
+               <h3 className="font-black uppercase tracking-widest text-xs">Escaneando Barra</h3>
+               <button onClick={() => setIsScannerOpen(false)} className="p-3 bg-white/10 rounded-full"><X size={24}/></button>
+            </div>
+            
+            <div className="flex-1 relative flex items-center justify-center">
+               <div id="reader" className="w-full h-full"></div>
+               {/* Overlay Visual */}
+               <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+                  <div className="w-72 h-48 border-2 border-amber-500 rounded-3xl relative">
+                    <div className="absolute top-0 left-0 w-8 h-8 border-t-4 border-l-4 border-amber-500 -mt-1 -ml-1 rounded-tl-lg"></div>
+                    <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-amber-500 -mt-1 -mr-1 rounded-tr-lg"></div>
+                    <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-amber-500 -mb-1 -ml-1 rounded-bl-lg"></div>
+                    <div className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-amber-500 -mb-1 -mr-1 rounded-br-lg"></div>
+                    <div className="absolute inset-0 bg-amber-500/10 animate-pulse"></div>
+                  </div>
+               </div>
+            </div>
+
+            <div className="p-8 bg-black/80 backdrop-blur-md">
+               <form onSubmit={handleScanSearch} className="flex gap-2">
+                 <input 
+                    type="number"
+                    value={scanInput}
+                    onChange={(e) => setScanInput(e.target.value)}
+                    placeholder="O escriba ID manualmente..."
+                    className="flex-1 bg-white/10 border-2 border-white/10 rounded-2xl p-4 text-center font-black text-xl text-white outline-none focus:border-amber-500 transition-all"
+                 />
+                 <button type="submit" className="bg-amber-600 p-4 text-white rounded-2xl shadow-lg active:scale-95"><Search size={24}/></button>
+               </form>
+               <p className="text-[10px] text-white/40 text-center mt-4 uppercase font-bold tracking-tighter">Coloque el código de barras frente a la cámara</p>
+            </div>
+          </div>
+        )}
+
+        <main className="flex-1 overflow-y-auto px-6 py-4 custom-scrollbar pb-24">
+          {view === 'menu' && (
+            <div className="space-y-6 animate-in fade-in duration-500">
+              <header className="flex justify-between items-center mt-2">
+                <div>
+                  <h1 className="text-2xl font-black text-slate-800 tracking-tight">INVENTARIO CBD</h1>
+                  <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">Planta de Producción</p>
+                </div>
+                <img src={APP_LOGO_URL} className="w-12 h-12 bg-amber-50 rounded-2xl p-2" alt="logo" />
+              </header>
+
+              <div className="grid grid-cols-2 gap-4">
+                <button onClick={() => setView('register')} className="bg-amber-900 p-5 rounded-[2rem] text-white flex flex-col gap-3 shadow-xl active:scale-95 transition-all">
+                  <div className="bg-white/20 w-fit p-2 rounded-xl"><Plus size={24} /></div>
+                  <span className="font-black uppercase text-xs text-left">Nuevo<br/>Registro</span>
+                </button>
+                <button onClick={() => setView('history')} className="bg-slate-800 p-5 rounded-[2rem] text-white flex flex-col gap-3 shadow-xl active:scale-95 transition-all">
+                  <div className="bg-white/20 w-fit p-2 rounded-xl"><History size={24} /></div>
+                  <span className="font-black uppercase text-xs text-left">Stock<br/>Real</span>
+                </button>
+              </div>
+
+              <div className="bg-white p-6 rounded-[2rem] border-2 border-slate-50 shadow-sm flex justify-between items-center">
+                <div className="flex items-center gap-3">
+                  <div className="bg-amber-100 p-3 rounded-2xl text-amber-900"><Layers size={20}/></div>
+                  <span className="font-black text-slate-800 uppercase text-xs">Total Stock</span>
+                </div>
+                <span className="text-2xl font-black text-amber-900">{packages.length}</span>
+              </div>
+
+              <section className="space-y-3">
+                <h2 className="font-black text-slate-800 uppercase text-xs tracking-widest px-1">Ingresos Recientes</h2>
+                {packages.slice(0, 3).map((p, i) => (
+                  <div key={i} onClick={() => setSelectedPackage(p)} className="flex items-center gap-4 p-4 bg-slate-50 rounded-[1.5rem] border border-white shadow-sm active:scale-95 transition-transform">
+                    <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-black text-xs ${getStatusColor(p.estado)}`}>{p.materia.charAt(0)}</div>
+                    <div className="flex-1">
+                      <p className="font-black text-sm text-slate-800">{p.materia}</p>
+                      <p className="text-[10px] text-slate-400 font-bold uppercase">{p.procedencia} • {p.volumen} m³</p>
+                    </div>
+                    <ChevronRight size={16} className="text-slate-300" />
+                  </div>
+                ))}
+              </section>
+            </div>
+          )}
+
+          {view === 'register' && (
+            <div className="space-y-6 animate-in slide-in-from-right duration-300">
+              <div className="flex items-center gap-4">
+                <button onClick={() => { setView('menu'); setFormData({...formData, oldId: null}); }} className="p-3 bg-slate-100 rounded-2xl"><ArrowLeft size={20} /></button>
+                <h1 className="text-xl font-black uppercase text-slate-800">{formData.oldId ? 'Editar Paquete' : 'Nuevo Registro'}</h1>
+              </div>
+              <form onSubmit={handleRegister} className="space-y-4">
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black text-slate-400 uppercase ml-2">Materia</label>
+                  <select value={formData.materia} onChange={e => setFormData({...formData, materia: e.target.value})} className="w-full p-4 bg-slate-50 rounded-2xl border-2 border-transparent focus:border-amber-500 font-bold outline-none">
+                    {['Tabla', 'Taco', 'Liston', 'Yugo', 'Descarte'].map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                </div>
+
+                {formData.materia === 'Descarte' ? (
+                  <div className="space-y-1 animate-in zoom-in-95 duration-200">
+                    <label className="text-[10px] font-black text-slate-400 uppercase ml-2">Volumen Manual (m³)</label>
+                    <input 
+                      required 
+                      type="number" 
+                      step="0.0001"
+                      value={formData.volumenManual} 
+                      onChange={e => setFormData({...formData, volumenManual: e.target.value})} 
+                      className="w-full p-4 bg-amber-50 rounded-2xl font-black text-amber-900 outline-none border-2 border-amber-200" 
+                      placeholder="Ej: 0.4500" 
+                    />
+                  </div>
+                ) : (
+                  <div className="space-y-4 animate-in fade-in duration-200">
+                    <div className="grid grid-cols-3 gap-2">
+                       <div className="space-y-1"><label className="text-[8px] font-black text-slate-400 uppercase ml-2">L (mm)</label><input required type="number" value={formData.largo} onChange={e => setFormData({...formData, largo: e.target.value})} className="w-full p-3 bg-slate-50 rounded-xl font-bold outline-none" placeholder="0"/></div>
+                       <div className="space-y-1"><label className="text-[8px] font-black text-slate-400 uppercase ml-2">A (mm)</label><input required type="number" value={formData.ancho} onChange={e => setFormData({...formData, ancho: e.target.value})} className="w-full p-3 bg-slate-50 rounded-xl font-bold outline-none" placeholder="0"/></div>
+                       <div className="space-y-1"><label className="text-[8px] font-black text-slate-400 uppercase ml-2">E (mm)</label><input required type="number" value={formData.espesor} onChange={e => setFormData({...formData, espesor: e.target.value})} className="w-full p-3 bg-slate-50 rounded-xl font-bold outline-none" placeholder="0"/></div>
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-black text-slate-400 uppercase ml-2">Cantidad Piezas</label>
+                      <input required type="number" value={formData.cantidad} onChange={e => setFormData({...formData, cantidad: e.target.value})} className="w-full p-4 bg-slate-50 rounded-2xl font-bold outline-none" placeholder="0" />
+                    </div>
+                  </div>
+                )}
+
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black text-slate-400 uppercase ml-2">Lote / Origen</label>
+                  <input required type="text" value={formData.procedencia} onChange={e => setFormData({...formData, procedencia: e.target.value})} className="w-full p-4 bg-slate-50 rounded-2xl font-bold outline-none border-2 border-transparent focus:border-amber-500" placeholder="LOTE-001" />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black text-slate-400 uppercase ml-2">Estado de Ingreso</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {['Stock', 'Despacho', 'Recibido'].map(status => (
+                      <button 
+                        key={status}
+                        type="button"
+                        onClick={() => setFormData({...formData, estado: status})}
+                        className={`py-3 rounded-xl text-[10px] font-black uppercase transition-all border-2 ${formData.estado === status ? 'border-amber-900 bg-amber-900 text-white shadow-md' : 'border-slate-100 bg-slate-50 text-slate-400'}`}
+                      >
+                        {status}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <button type="submit" disabled={loading} className="w-full bg-amber-900 text-white font-black py-5 rounded-2xl shadow-xl active:scale-95 disabled:opacity-50 mt-4 uppercase text-xs">
+                  {loading ? <Loader2 className="animate-spin mx-auto" /> : (formData.oldId ? 'Guardar Cambios' : 'Registrar e Imprimir')}
+                </button>
+              </form>
+            </div>
+          )}
+
+          {view === 'history' && (
+            <div className="space-y-6 animate-in fade-in">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                  <button onClick={() => setView('menu')} className="p-3 bg-slate-100 rounded-2xl"><ArrowLeft size={20} /></button>
+                  <h1 className="text-xl font-black uppercase text-slate-800">Stock Real</h1>
+                </div>
+                <button onClick={exportToExcel} className="p-3 bg-green-600 text-white rounded-2xl shadow-lg active:scale-90 flex items-center gap-2">
+                  <FileDown size={20} /> <span className="text-xs font-bold uppercase">Excel</span>
+                </button>
+              </div>
+              <div className="space-y-3">
+                {packages.map((p, i) => (
+                  <div key={i} onClick={() => setSelectedPackage(p)} className="bg-white p-4 rounded-[1.5rem] border border-slate-100 shadow-sm flex justify-between items-center active:bg-slate-50 transition-colors">
+                    <div className="flex items-center gap-4">
+                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-black text-xs uppercase ${getStatusColor(p.estado)}`}>{p.materia.charAt(0)}</div>
+                      <div className="flex-1">
+                        <p className="font-black text-sm text-slate-800">{p.materia}</p>
+                        <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">#{p.id} • {p.volumen} m³</p>
+                        <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                          <span className={`text-[8px] font-black uppercase px-1.5 py-0.5 rounded-md ${getStatusColor(p.estado)}`}>{p.estado}</span>
+                          <span className="text-[8px] text-slate-900 font-black uppercase bg-slate-100 px-1 rounded">{p.procedencia}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <ChevronRight size={16} className="text-slate-300" />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </main>
+
+        <nav className="fixed bottom-0 left-0 right-0 bg-white/95 backdrop-blur-md border-t border-slate-100 flex justify-around items-center px-6 h-20 pb-4 z-[500]">
+          <button onClick={() => setView('menu')} className={`flex flex-col items-center gap-1 ${view === 'menu' ? 'text-amber-800' : 'text-slate-300'}`}><Package size={22} /><span className="text-[10px] font-bold uppercase">Inicio</span></button>
+          <button onClick={() => setView('history')} className={`flex flex-col items-center gap-1 ${view === 'history' ? 'text-amber-800' : 'text-slate-300'}`}><History size={22} /><span className="text-[10px] font-bold uppercase">Stock</span></button>
+          <div className="relative -mt-10">
+            <button onClick={() => setView('register')} className="bg-amber-900 p-4 rounded-full text-white shadow-2xl active:scale-90 border-[4px] border-white"><Plus size={24} /></button>
+          </div>
+          <button onClick={() => setIsScannerOpen(true)} className={`flex flex-col items-center gap-1 ${isScannerOpen ? 'text-amber-800' : 'text-slate-300'}`}>
+            <ScanLine size={22} /><span className="text-[10px] font-bold uppercase">Scan</span>
+          </button>
+          <button onClick={exportToExcel} className="flex flex-col items-center gap-1 text-slate-300"><Download size={22} /><span className="text-[10px] font-bold uppercase">Reporte</span></button>
+        </nav>
+
+        {selectedPackage && (
+          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[1000] flex items-end animate-in fade-in duration-300">
+            <div className="bg-white w-full rounded-t-[2.5rem] p-8 space-y-6 animate-in slide-in-from-bottom duration-400 max-h-[95%] overflow-y-auto shadow-2xl no-scrollbar">
+              <div className="flex justify-between items-center">
+                <span className={`px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest ${getStatusColor(selectedPackage.estado)}`}>
+                  Paquete en {selectedPackage.estado}
+                </span>
+                <button onClick={() => { setSelectedPackage(null); setConfirmDelete(false); }} className="p-2 bg-slate-100 rounded-full text-slate-400"><X size={20}/></button>
+              </div>
+
+              {confirmDelete ? (
+                <div className="text-center py-6 space-y-6">
+                  <div className="w-20 h-20 bg-red-50 text-red-600 rounded-full flex items-center justify-center mx-auto"><Trash2 size={40} /></div>
+                  <h3 className="text-xl font-black text-slate-800 uppercase">¿Confirmar Borrado?</h3>
+                  <button onClick={() => deletePackage(selectedPackage.id)} className="w-full bg-red-600 text-white font-black py-5 rounded-[2rem] uppercase text-xs">Eliminar Definitivamente</button>
+                  <button onClick={() => setConfirmDelete(false)} className="w-full text-slate-400 font-black uppercase text-xs">Volver</button>
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  <div className="text-center">
+                    <h2 className="text-3xl font-black text-slate-800 uppercase">{selectedPackage.materia}</h2>
+                    <p className="text-xs font-black text-slate-400 uppercase tracking-widest">{selectedPackage.procedencia}</p>
+                    <p className="text-[10px] font-bold text-slate-300 mt-2 uppercase">{selectedPackage.fecha}</p>
+                  </div>
+
+                  <div className="bg-white p-4 rounded-[2rem] border-2 border-slate-50 flex flex-col items-center gap-4">
+                    <BarcodeDisplay value={selectedPackage.id} id="barcode-print" />
+                    <button onClick={printBarcode} className="flex items-center gap-2 text-xs font-black text-amber-900 uppercase bg-amber-50 px-6 py-2 rounded-full border border-amber-200">
+                      <Printer size={16}/> Imprimir Etiqueta
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-5 bg-slate-50 rounded-3xl border border-white text-center">
+                      <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Volumen</p>
+                      <p className="text-lg font-black text-slate-800">{selectedPackage.volumen} m³</p>
+                    </div>
+                    <div className="p-5 bg-slate-50 rounded-3xl border border-white text-center">
+                      <p className="text-[9px] font-black text-slate-400 uppercase mb-1">Cantidad</p>
+                      <p className="text-lg font-black text-slate-800">{selectedPackage.cantidad || '-'} Pzs</p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-3">
+                    <p className="text-[10px] font-black text-slate-400 uppercase text-center tracking-widest">Transformar Estado</p>
+                    <div className="grid grid-cols-3 gap-2">
+                      <button onClick={() => updateStatus(selectedPackage.id, 'Stock')} className={`py-3 rounded-2xl text-[9px] font-black uppercase border-2 transition-all ${selectedPackage.estado === 'Stock' ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-50 text-slate-400'}`}>Stock</button>
+                      <button onClick={() => updateStatus(selectedPackage.id, 'Despacho')} className={`py-3 rounded-2xl text-[9px] font-black uppercase border-2 transition-all ${selectedPackage.estado === 'Despacho' ? 'border-orange-500 bg-orange-50 text-orange-700' : 'border-slate-50 text-slate-400'}`}>Despacho</button>
+                      <button onClick={() => updateStatus(selectedPackage.id, 'Recibido')} className={`py-3 rounded-2xl text-[9px] font-black uppercase border-2 transition-all ${selectedPackage.estado === 'Recibido' ? 'border-green-500 bg-green-50 text-green-700' : 'border-slate-50 text-slate-400'}`}>Recibido</button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3 pt-2">
+                    <button onClick={() => editPackage(selectedPackage)} className="flex items-center justify-center gap-2 bg-slate-800 text-white py-4 rounded-2xl font-black text-[10px] uppercase shadow-lg"><Edit3 size={16} /> Editar Datos</button>
+                    <button onClick={() => setConfirmDelete(true)} className="flex items-center justify-center gap-2 bg-red-50 text-red-600 py-4 rounded-2xl font-black text-[10px] uppercase border border-red-100"><Trash2 size={16} /> Borrar</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        #reader video { 
+          object-fit: cover !important; 
+          width: 100% !important; 
+          height: 100% !important;
+          border-radius: 0;
+        }
+        @media print {
+          nav, button, .no-print { display: none !important; }
+        }
+      `}</style>
+    </div>
+  );
+}
